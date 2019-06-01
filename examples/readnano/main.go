@@ -13,7 +13,7 @@ import (
 
 const defaultUri = "tcp://tanglebeat.com:5550"
 
-var topics = []string{"lmi", "lmhs"}
+var topics = []string{"lmi", "lmhs", "seen", "tx"}
 
 func main() {
 	pstr := flag.String("uri", defaultUri, "Nanomsg stream URI")

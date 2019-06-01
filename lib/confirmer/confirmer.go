@@ -46,8 +46,7 @@ type Confirmer struct {
 	confMon   *ConfirmationMonitor
 
 	// confirmer task state
-	running               bool
-	runningMutex          *sync.RWMutex
+
 	chanUpdate            chan *ConfirmerUpdate
 	lastBundleTrytes      []Trytes
 	bundleHash            Hash
@@ -59,6 +58,10 @@ type Confirmer struct {
 	totalDurationATTMsec  uint64
 	totalDurationGTTAMsec uint64
 	isNotPromotable       bool
+
+	// starting/stoping state
+	running      bool
+	runningMutex *sync.RWMutex
 }
 
 type ConfirmerUpdate struct {
@@ -179,9 +182,7 @@ func (conf *Confirmer) StartConfirmerTask(bundleTrytes []Trytes) (chan *Confirme
 
 	// confirmation monitor starts yet another routine
 	conf.confMon.OnConfirmation(bundleHash, func(nowis time.Time) {
-		conf.mutex.RLock()
-		defer conf.mutex.RUnlock()
-		conf.sendConfirmerUpdate(UPD_CONFIRM, "", nil)
+		conf.postConfirmerUpdate(UPD_CONFIRM, "", nil)
 	})
 
 	conf.running = true
@@ -200,6 +201,8 @@ func (conf *Confirmer) stopConfirmerTask(cancelPromoCheck, cancelPromo, cancelRe
 		return
 	}
 
+	conf.Log.Debugf("CONFIRMER: stopping task for '%v'", conf.bundleHash)
+
 	cancelPromoCheck()
 	cancelPromo()
 	cancelReattach()
@@ -210,18 +213,31 @@ func (conf *Confirmer) stopConfirmerTask(cancelPromoCheck, cancelPromo, cancelRe
 	conf.Log.Debugf("CONFIRMER: task for %v has ended", conf.bundleHash)
 }
 
-func (conf *Confirmer) sendConfirmerUpdate(updType UpdateType, promoTailHash Hash, err error) {
-	upd := &ConfirmerUpdate{
-		NumAttaches:           conf.numAttach,
-		NumPromotions:         conf.numPromote,
-		TotalDurationATTMsec:  conf.totalDurationATTMsec,
-		TotalDurationGTTAMsec: conf.totalDurationATTMsec,
-		UpdateTime:            time.Now(),
-		UpdateType:            updType,
-		PromoteTailHash:       promoTailHash,
-		Err:                   err,
-	}
-	conf.chanUpdate <- upd
+// async post to update channel.
+// async needed so that it doesn't deadlock during task closing
+
+func (conf *Confirmer) postConfirmerUpdate(updType UpdateType, promoTailHash Hash, err error) {
+	go func() {
+		conf.runningMutex.RLock()
+		defer conf.runningMutex.RUnlock()
+
+		if !conf.running {
+			//  to avoid sending update to already closed channel
+			//  (when task is being stopped by `stopConfirmerTask`
+			return
+		}
+		upd := &ConfirmerUpdate{
+			NumAttaches:           conf.numAttach,
+			NumPromotions:         conf.numPromote,
+			TotalDurationATTMsec:  conf.totalDurationATTMsec,
+			TotalDurationGTTAMsec: conf.totalDurationATTMsec,
+			UpdateTime:            time.Now(),
+			UpdateType:            updType,
+			PromoteTailHash:       promoTailHash,
+			Err:                   err,
+		}
+		conf.chanUpdate <- upd
+	}()
 }
 
 func (conf *Confirmer) checkConsistency(tailHash Hash) (bool, error) {
@@ -283,9 +299,9 @@ func (conf *Confirmer) promoteIfNeeded() error {
 	}
 	err, tailh := conf.promote()
 	if err != nil {
-		conf.sendConfirmerUpdate(UPD_NO_ACTION, "", err)
+		conf.postConfirmerUpdate(UPD_NO_ACTION, "", err)
 	} else {
-		conf.sendConfirmerUpdate(UPD_PROMOTE, tailh, nil)
+		conf.postConfirmerUpdate(UPD_PROMOTE, tailh, nil)
 	}
 	return err
 }
@@ -329,9 +345,9 @@ func (conf *Confirmer) reattachIfNeeded() error {
 	if conf.isNotPromotable || time.Now().After(conf.nextForceReattachTime) {
 		err = conf.reattach()
 		if err != nil {
-			conf.sendConfirmerUpdate(UPD_NO_ACTION, "", err)
+			conf.postConfirmerUpdate(UPD_NO_ACTION, "", err)
 		} else {
-			conf.sendConfirmerUpdate(UPD_REATTACH, "", nil)
+			conf.postConfirmerUpdate(UPD_REATTACH, "", nil)
 		}
 	}
 	return err
@@ -349,7 +365,7 @@ func (conf *Confirmer) goReattach() func() {
 
 		for {
 			if err := conf.reattachIfNeeded(); err != nil {
-				conf.sendConfirmerUpdate(UPD_NO_ACTION, "", err)
+				conf.postConfirmerUpdate(UPD_NO_ACTION, "", err)
 				conf.errorf("reattach function returned: %v. Bundle hash = %v", err, conf.bundleHash)
 				time.Sleep(sleepAfterError)
 			}
